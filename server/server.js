@@ -3,11 +3,15 @@ import cors from 'cors';
 import { body, validationResult } from 'express-validator';
 import dotenv from 'dotenv';
 import mangaFacts from './data/mangaFacts.js';
-import subscriberStorage from './data/subscriberStorage.js';
+// Import in-memory storage functions
+import { isSubscribed, unsubscribe, getSubscribers } from './services/inMemoryStorage.js';
 import { sendWelcomeEmail, sendGoodbyeEmail } from './services/emailService.js';
+import { createAndSendOTP, verifyOTP } from './services/otpService.js';
 import { fileURLToPath } from 'url';
 import path from 'path';
 import { createHash } from 'crypto';
+// Import Firebase instance from config
+import { db } from './config/firebase.js';
 
 // Load environment variables from .env file
 dotenv.config();
@@ -18,9 +22,68 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// Middleware
-app.use(cors());
+// Configure CORS
+const allowedOrigins = [
+  'http://localhost:3000', 
+  'http://127.0.0.1:3000',
+  'http://localhost:3001',
+  'http://127.0.0.1:3001'
+];
+
+const corsOptions = {
+  origin: function (origin, callback) {
+    // Allow requests with no origin (like mobile apps or curl requests)
+    if (!origin) return callback(null, true);
+    
+    if (allowedOrigins.indexOf(origin) === -1) {
+      const msg = `The CORS policy for this site does not allow access from the specified origin: ${origin}`;
+      console.error(msg);
+      return callback(new Error(msg), false);
+    }
+    return callback(null, true);
+  },
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: true,
+  preflightContinue: false,
+  optionsSuccessStatus: 204
+};
+
+// Enable CORS first
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));
+
+// Parse JSON bodies
 app.use(express.json());
+
+// Add request logging middleware
+app.use((req, res, next) => {
+  console.log(`${new Date().toISOString()} - ${req.method} ${req.originalUrl}`);
+  if (req.body && Object.keys(req.body).length > 0) {
+    console.log('Request body:', JSON.stringify(req.body, null, 2));
+  }
+  next();
+});
+
+// Log all requests
+app.use((req, res, next) => {
+  console.log(`[${new Date().toISOString()}] ${req.method} ${req.originalUrl}`);
+  console.log('Headers:', req.headers);
+  console.log('Body:', req.body);
+  next();
+});
+
+// Test endpoint
+app.get('/test', (req, res) => {
+  console.log('Test endpoint hit');
+  res.json({ status: 'ok', message: 'Test endpoint working' });
+});
+
+// Log all requests
+app.use((req, res, next) => {
+  console.log(`${new Date().toISOString()} - ${req.method} ${req.url}`);
+  next();
+});
 
 // Get a random manga fact
 export const getRandomFact = () => {
@@ -39,6 +102,105 @@ const getTopMangaTitles = () => {
     .slice(0, 5)
     .map(([title]) => title);
 };
+
+// OTP Verification Endpoints
+app.post('/api/send-otp', 
+  [
+    body('email')
+      .isEmail()
+      .withMessage('Please enter a valid email')
+      .normalizeEmail()
+  ],
+  async (req, res) => {
+    console.log('Received send-otp request:', req.body);
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ 
+        success: false,
+        error: errors.array()[0].msg 
+      });
+    }
+
+    const { email } = req.body;
+
+    try {
+      const result = await createAndSendOTP(email);
+      if (result.alreadyVerified) {
+        return res.json({ 
+          success: true, 
+          message: 'Email already verified',
+          verified: true
+        });
+      }
+      res.json({ 
+        success: true, 
+        message: 'Verification code sent to your email' 
+      });
+    } catch (error) {
+      console.error('Error sending OTP:', error);
+      res.status(500).json({ 
+        success: false,
+        error: 'Failed to send verification code' 
+      });
+    }
+  }
+);
+
+app.post('/api/verify-otp',
+  [
+    body('email')
+      .isEmail()
+      .withMessage('Please enter a valid email')
+      .normalizeEmail(),
+    body('otp')
+      .isLength({ min: 6, max: 6 })
+      .withMessage('Verification code must be 6 digits')
+      .isNumeric()
+      .withMessage('Verification code must be numeric')
+  ],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ 
+        success: false,
+        error: errors.array()[0].msg 
+      });
+    }
+
+    const { email, otp } = req.body;
+
+    try {
+      console.log('Verifying OTP for:', email);
+      const result = await verifyOTP(email, otp);
+      
+      if (!result.success) {
+        console.log('OTP verification failed:', result.error);
+        return res.status(400).json(result);
+      }
+      
+      console.log('OTP verified successfully for:', email);
+      
+      // Send welcome email with a random manga fact
+      const quote = getRandomFact();
+      console.log('Sending welcome email to:', email);
+      await sendWelcomeEmail(email, email.split('@')[0], quote);
+      
+      console.log('Subscription completed for:', email);
+      res.json({ 
+        success: true, 
+        message: 'Email verified successfully',
+        quote,
+        avatarUrl: `https://api.dicebear.com/8.x/avataaars/svg?seed=${createHash('md5').update(email).digest('hex')}&radius=50`
+      });
+    } catch (error) {
+      console.error('Error verifying OTP:', error);
+      res.status(500).json({ 
+        success: false,
+        error: 'Failed to verify code' 
+      });
+    }
+  }
+);
 
 // Routes
 app.get('/api/status', (req, res) => {
@@ -73,15 +235,14 @@ app.post(
 
     try {
       // Check if already subscribed
-      if (subscriberStorage.hasSubscriber(email)) {
+      if (isSubscribed(email)) {
         return res.status(409).json({ 
           success: false,
           error: 'This email is already subscribed' 
         });
       }
       
-      // Add subscriber
-      subscriberStorage.addSubscriber(email);
+      // Get a quote
       const quote = getRandomFact();
       
       // Send welcome email
@@ -97,12 +258,14 @@ app.post(
       console.error('Subscription error:', error);
       res.status(500).json({ 
         success: false,
-        error: error.message || 'Failed to process subscription' 
+        error: 'Failed to process subscription',
+        details: error.message 
       });
     }
   }
 );
 
+// Unsubscribe endpoint
 app.post(
   '/api/unsubscribe',
   [
@@ -112,44 +275,67 @@ app.post(
       .normalizeEmail()
   ],
   async (req, res) => {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(400).json({ 
-        success: false,
-        error: errors.array()[0].msg 
-      });
-    }
-
-    const { email } = req.body;
-
     try {
-      // Check if email exists before attempting to remove
-      if (!subscriberStorage.hasSubscriber(email)) {
-        return res.status(404).json({ 
-          success: false,
-          error: 'This email is not in our subscription list' 
-        });
+      console.log('Unsubscribe request received:', req.body);
+      
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) {
+        console.log('Validation errors:', errors.array());
+        return res.status(400).json({ errors: errors.array() });
       }
-      
+
+      const { email } = req.body;
+
+      // Check if email exists before attempting to remove
+      const isUserSubscribed = await isSubscribed(email);
+      if (!isUserSubscribed) {
+        console.log('Not subscribed:', email);
+        return res.status(404).json({ error: 'Email is not subscribed' });
+      }
+
       // Remove subscriber
-      await subscriberStorage.removeSubscriber(email);
-      
+      await unsubscribe(email);
+
       // Send goodbye email
-      await sendGoodbyeEmail(email, 'Manga Fan');
-      
-      res.status(200).json({ 
+      console.log('Sending goodbye email to:', email);
+      await sendGoodbyeEmail(email, email.split('@')[0]);
+
+      console.log('Unsubscription successful for:', email);
+      res.json({ 
         success: true,
-        message: 'Successfully unsubscribed from MangaByte' 
+        message: 'Successfully unsubscribed' 
       });
     } catch (error) {
       console.error('Unsubscription error:', error);
       res.status(500).json({ 
         success: false,
-        error: error.message || 'Failed to process unsubscription' 
+        error: 'Failed to process unsubscription',
+        details: error.message 
       });
     }
   }
 );
+
+// Status endpoint
+app.get('/api/status', (req, res) => {
+  try {
+    const subscribers = getSubscribers();
+    const topTitles = getTopMangaTitles();
+    
+    res.json({
+      status: 'active',
+      subscribers: subscribers.size, // Using size for Set
+      topMangaTitles: topTitles
+    });
+  } catch (error) {
+    console.error('Status check error:', error);
+    res.status(500).json({
+      status: 'error',
+      error: 'Failed to get status',
+      details: error.message
+    });
+  }
+});
 
 // Error handling middleware
 app.use((err, req, res, next) => {
