@@ -1,9 +1,8 @@
 {
-  "name": "mangabyte-backend",
+  "name": "mangabyte-functions",
   "version": "1.0.0",
-  "description": "Backend server for MangaByte",
-  "main": "server.js",
-  "type": "module",
+  "description": "Cloud Functions for MangaByte",
+  "main": "index.js",
   "scripts": {
     "start": "node server.js",
     "dev": "nodemon server.js"
